@@ -1,0 +1,4 @@
+Automation identity probe for the Curvine daily regression tester.
+Generated: 20261028T030840Z
+Purpose: verify branch push and pull-request submission capability.
+This file is removed together with the probe branch.
