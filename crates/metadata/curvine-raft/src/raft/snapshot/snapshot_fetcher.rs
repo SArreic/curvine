@@ -19,14 +19,14 @@ use crate::raft::{RaftClient, RaftError, RaftResult};
 use curvine_config::JournalConf;
 use curvine_core_error::err_box;
 use curvine_runtime::common::{FileUtils, Utils};
-use log::info;
+use log::{debug, info};
 use std::path::{Path, PathBuf};
 
 pub enum SnapshotFetcher {
     Local(SnapshotData),
     // Files of another member's snapshot are readable from this host, but this
-    // member must still own the copy it installs, so they are copied into the
-    // directory carried here before the snapshot is returned.
+    // member must still own the copy it installs, so they are materialized into
+    // the directory carried here before the snapshot is returned.
     OwnedCopy(SnapshotData, String),
     Remote(SnapshotData, DownloadJob),
 }
@@ -66,17 +66,16 @@ impl SnapshotFetcher {
             if Self::local_snapshot_ready(&files.dir, &files.files) {
                 let dir = app_store.snapshot_dir(Utils::rand_id())?;
                 if dir.trim().is_empty() {
-                    // A store that cannot name a private snapshot directory cannot
-                    // own a copy. Keep reading the files in place; the directory
-                    // convention is only guaranteed by stores that implement one.
-                    info!(
-                        "snapshot {} from node {} is readable at {}, reused in place; the app store exposes no snapshot directory",
-                        data.snapshot_id, data.node_id, files.dir
+                    // A store that cannot name a snapshot directory cannot own a
+                    // copy, and must not fall back to reading another member's
+                    // directory in place.
+                    return err_box!(
+                        "app storage returned an empty snapshot directory; it cannot own a copy of snapshot {}",
+                        data.snapshot_id
                     );
-                    return Ok(Self::Local(data));
                 }
                 info!(
-                    "snapshot {} from node {} is readable at {}, copy it to {} instead of adopting that directory",
+                    "snapshot {} from node {} is readable at {}, materialize it under {} instead of adopting that directory",
                     data.snapshot_id, data.node_id, files.dir, dir
                 );
                 return Ok(Self::OwnedCopy(data, dir));
@@ -106,26 +105,35 @@ impl SnapshotFetcher {
         })
     }
 
-    /// Copies a snapshot that is already readable on this host into `dir` so the
-    /// local member owns the files it installs. Sizes are verified against the
-    /// manifest, the bytes and their directory entries are synced before the copy
-    /// can be published, and a partial copy is removed by the caller.
-    fn copy_snapshot(source: &str, dir: &str, files: &[SnapshotFileInfo]) -> RaftResult<()> {
+    /// Materializes a snapshot that is already readable on this host into `dir`
+    /// so the local member owns the files it installs. A checkpoint file is
+    /// immutable once created, so it is hard linked where the filesystem allows
+    /// it and copied otherwise. Sizes are verified against the manifest, and both
+    /// the file bytes and every directory entry created here are synced before
+    /// the copy can be published.
+    fn materialize_snapshot(source: &str, dir: &str, files: &[SnapshotFileInfo]) -> RaftResult<()> {
+        let dir = Path::new(dir);
         let mut synced_dirs: Vec<PathBuf> = Vec::new();
+        Self::create_dirs_and_collect(dir, &mut synced_dirs)?;
 
         for file in files {
             let from = Path::new(source).join(&file.path);
-            let to = Path::new(dir).join(&file.path);
+            let to = dir.join(&file.path);
             if let Some(parent) = to.parent() {
-                FileUtils::create_dir(parent, true)?;
-                if !synced_dirs.iter().any(|synced| synced == parent) {
-                    synced_dirs.push(parent.to_path_buf());
-                }
+                Self::create_dirs_and_collect(parent, &mut synced_dirs)?;
             }
-            std::fs::copy(&from, &to)?;
-            // The installed manifest and the trimmed journal will point at this
-            // copy, so the bytes must survive a crash before it is published.
-            std::fs::File::open(&to)?.sync_all()?;
+
+            if let Err(e) = std::fs::hard_link(&from, &to) {
+                // Cross-device paths and filesystems without hard links need a
+                // real copy of the immutable checkpoint file.
+                debug!(
+                    "snapshot file {} cannot be linked ({}), copying it instead",
+                    from.display(),
+                    e
+                );
+                std::fs::copy(&from, &to)?;
+                std::fs::File::open(&to)?.sync_all()?;
+            }
 
             let copied = std::fs::metadata(&to)?.len();
             if copied != file.len {
@@ -138,13 +146,53 @@ impl SnapshotFetcher {
             }
         }
 
-        // Directory entries need their own sync, otherwise a crash can lose a
-        // file that was already appended to the directory.
-        for synced in synced_dirs.iter().rev() {
-            std::fs::File::open(synced)?.sync_all()?;
+        // A directory entry is durable only once its own directory is synced. The
+        // collected list is deepest first, so syncing it in reverse makes every
+        // parent entry durable before the directory that depends on it.
+        for created in synced_dirs.iter().rev() {
+            std::fs::File::open(created)?.sync_all()?;
         }
 
         Ok(())
+    }
+
+    /// Creates `dir` and records every directory this call created, plus the
+    /// deepest directory that already existed because its entry list changed.
+    fn create_dirs_and_collect(dir: &Path, synced: &mut Vec<PathBuf>) -> RaftResult<()> {
+        if dir.as_os_str().is_empty() {
+            return err_box!("cannot materialize a snapshot under an empty directory path");
+        }
+        if dir.is_dir() {
+            Self::push_dir(synced, dir);
+            return Ok(());
+        }
+
+        let mut missing: Vec<PathBuf> = Vec::new();
+        let mut existing = dir.parent();
+        while let Some(path) = existing {
+            if path.as_os_str().is_empty() || path.is_dir() {
+                break;
+            }
+            missing.push(path.to_path_buf());
+            existing = path.parent();
+        }
+
+        FileUtils::create_dir(dir, true)?;
+        Self::push_dir(synced, dir);
+        for path in &missing {
+            Self::push_dir(synced, path);
+        }
+        if let Some(parent) = existing {
+            Self::push_dir(synced, parent);
+        }
+        Ok(())
+    }
+
+    fn push_dir(synced: &mut Vec<PathBuf>, dir: &Path) {
+        if dir.as_os_str().is_empty() || synced.iter().any(|seen| seen == dir) {
+            return;
+        }
+        synced.push(dir.to_path_buf());
     }
 
     pub async fn fetch(self) -> RaftResult<SnapshotData> {
@@ -158,13 +206,14 @@ impl SnapshotFetcher {
                 };
 
                 let copy_dir = dir.clone();
-                let copied = tokio::task::spawn_blocking(move || {
-                    Self::copy_snapshot(&source, &copy_dir, &files)
+                let materialized = tokio::task::spawn_blocking(move || {
+                    Self::materialize_snapshot(&source, &copy_dir, &files)
                 })
                 .await
-                .map_err(|e| RaftError::from(format!("snapshot copy task failed: {e}")))?;
+                .map_err(|e| RaftError::from(format!("snapshot copy task failed: {e}")))
+                .and_then(|result| result);
 
-                if let Err(e) = copied {
+                if let Err(e) = materialized {
                     let _ = FileUtils::delete_path(&dir, true);
                     return Err(e);
                 }
@@ -173,7 +222,7 @@ impl SnapshotFetcher {
                     files.dir = dir;
                 }
                 info!(
-                    "snapshot {} copied, this member now owns {}",
+                    "snapshot {} materialized, this member now owns {}",
                     data.snapshot_id,
                     data.data_dir()
                 );

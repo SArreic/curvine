@@ -1009,11 +1009,10 @@ fn snapshot_fetcher_owns_a_local_copy_of_remote_snapshot() -> CommonResult<()> {
     Ok(())
 }
 
-/// A store that cannot name a private snapshot directory cannot own a copy, so
-/// the readable files stay in place; only stores that manage a directory get the
-/// ownership copy.
+/// A store that cannot name a snapshot directory cannot own a copy, so building
+/// the fetcher fails instead of silently adopting another member's directory.
 #[test]
-fn snapshot_fetcher_reads_in_place_without_a_private_snapshot_dir() -> CommonResult<()> {
+fn snapshot_fetcher_errors_without_a_private_snapshot_dir() -> CommonResult<()> {
     let conf = JournalConf::with_test();
     let rt = conf.create_runtime();
     let source = Utils::test_sub_dir(format!("snapshot-no-own-root-{}", Utils::rand_id()));
@@ -1025,12 +1024,12 @@ fn snapshot_fetcher_reads_in_place_without_a_private_snapshot_dir() -> CommonRes
     let mut data = reported_snapshot(5, 7);
     data.files_data = Some(files_in_dir(&source));
 
-    let fetcher =
-        SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
-
+    let err = SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data)
+        .err()
+        .expect("a store without a snapshot directory must not own a copy");
     assert!(
-        matches!(fetcher, SnapshotFetcher::Local(_)),
-        "without a store-managed snapshot directory the readable files stay in place"
+        err.to_string().contains("empty snapshot directory"),
+        "unexpected error: {err}"
     );
 
     FileUtils::delete_path(&source, true)?;
